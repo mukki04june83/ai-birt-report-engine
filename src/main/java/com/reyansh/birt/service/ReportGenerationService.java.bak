@@ -1,0 +1,243 @@
+package com.reyansh.birt.service;
+
+import com.reyansh.birt.model.ReportRequest;
+import com.reyansh.birt.model.ReportResponse;
+import lombok.extern.slf4j.Slf4j;
+import org.eclipse.birt.report.engine.api.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Service for generating BIRT reports with multithreading support
+ * Supports parallel report generation for scalability
+ */
+@Slf4j
+@Service
+public class ReportGenerationService {
+
+    @Autowired
+    private IReportEngine reportEngine;
+
+    @Value("${birt.report.directory:reports/templates}")
+    private String reportDirectory;
+
+    @Value("${birt.output.directory:reports/output}")
+    private String outputDirectory;
+
+    // Track report generation status
+    private final Map<String, String> reportStatus = new ConcurrentHashMap<>();
+
+    // Format to render format mapping
+    private static final Map<String, String> FORMAT_MAP = new HashMap<>();
+
+    static {
+        FORMAT_MAP.put("pdf", "pdf");
+        FORMAT_MAP.put("html", "html");
+        FORMAT_MAP.put("xls", "xls");
+        FORMAT_MAP.put("xlsx", "xlsx");
+        FORMAT_MAP.put("doc", "doc");
+        FORMAT_MAP.put("docx", "docx");
+        FORMAT_MAP.put("ppt", "ppt");
+        FORMAT_MAP.put("pptx", "pptx");
+        FORMAT_MAP.put("xml", "xml");
+    }
+
+    /**
+     * Generate report asynchronously
+     * Uses thread pool for parallel processing
+     */
+    @Async("reportTaskExecutor")
+    public CompletableFuture<ReportResponse> generateReportAsync(ReportRequest request) {
+        String reportId = UUID.randomUUID().toString();
+        log.info("Starting async report generation - ID: {}, Report: {}, Format: {}", 
+                reportId, request.getReportName(), request.getOutputFormat());
+        
+        reportStatus.put(reportId, "PROCESSING");
+        
+        try {
+            ReportResponse response = generateReport(request, reportId);
+            reportStatus.put(reportId, response.isSuccess() ? "COMPLETED" : "FAILED");
+            return CompletableFuture.completedFuture(response);
+        } catch (Exception e) {
+            log.error("Error generating report asynchronously - ID: {}", reportId, e);
+            reportStatus.put(reportId, "FAILED");
+            return CompletableFuture.completedFuture(ReportResponse.error(e.getMessage()));
+        }
+    }
+
+    /**
+     * Generate report synchronously
+     */
+    public ReportResponse generateReport(ReportRequest request, String reportId) {
+        long startTime = System.currentTimeMillis();
+        
+        try {
+            log.debug("Generating report - ID: {}, Name: {}, Format: {}", 
+                    reportId, request.getReportName(), request.getOutputFormat());
+
+            // Create output directory if not exists
+            File outputDir = new File(outputDirectory);
+            if (!outputDir.exists()) {
+                outputDir.mkdirs();
+                log.info("Created output directory: {}", outputDirectory);
+            }
+
+            // Prepare report design file path
+            String reportDesignPath = reportDirectory + File.separator + request.getReportName();
+            if (!reportDesignPath.endsWith(".rptdesign")) {
+                reportDesignPath += ".rptdesign";
+            }
+
+            File reportDesignFile = new File(reportDesignPath);
+            if (!reportDesignFile.exists()) {
+                throw new RuntimeException("Report design file not found: " + reportDesignPath);
+            }
+
+            // Open report design
+            IReportRunnable design = reportEngine.openReportDesign(reportDesignPath);
+
+            // Create run task
+            IRunTask runTask = reportEngine.createRunTask(design);
+            
+            // Set parameters if provided
+            if (request.getParameters() != null && !request.getParameters().isEmpty()) {
+                for (Map.Entry<String, Object> entry : request.getParameters().entrySet()) {
+                    runTask.setParameterValue(entry.getKey(), entry.getValue());
+                }
+                log.debug("Set {} parameters for report", request.getParameters().size());
+            }
+
+            // Set locale if provided
+            if (request.getLocale() != null) {
+                runTask.setLocale(new java.util.Locale(request.getLocale()));
+            }
+
+            // Generate document (rptdocument)
+            String rptDocumentPath = outputDirectory + File.separator + reportId + ".rptdocument";
+            runTask.run(rptDocumentPath);
+            runTask.close();
+            
+            log.debug("Report document generated: {}", rptDocumentPath);
+
+            // Render report to desired format
+            String outputFileName = request.getOutputFileName() != null 
+                    ? request.getOutputFileName() 
+                    : reportId;
+            String outputFilePath = outputDirectory + File.separator + outputFileName + "." + request.getOutputFormat();
+
+            // Open report document
+            IReportDocument reportDocument = reportEngine.openReportDocument(rptDocumentPath);
+
+            // Create render task
+            IRenderTask renderTask = reportEngine.createRenderTask(reportDocument);
+
+            // Set rendering options
+            IRenderOption options = createRenderOptions(request.getOutputFormat(), outputFilePath);
+            renderTask.setRenderOption(options);
+
+            // Set page range for PDF if provided
+            if ("pdf".equalsIgnoreCase(request.getOutputFormat()) && request.getPageRange() != null) {
+                renderTask.setPageRange(request.getPageRange());
+            }
+
+            // Render report
+            renderTask.render();
+            renderTask.close();
+            reportDocument.close();
+
+            // Clean up rptdocument file
+            new File(rptDocumentPath).delete();
+
+            long endTime = System.currentTimeMillis();
+            long duration = endTime - startTime;
+
+            log.info("Report generated successfully - ID: {}, Format: {}, Time: {}ms", 
+                    reportId, request.getOutputFormat(), duration);
+
+            String downloadUrl = "/api/reports/download/" + new File(outputFilePath).getName();
+
+            return ReportResponse.success(reportId, outputFilePath, request.getOutputFormat(), 
+                    duration, downloadUrl);
+
+        } catch (Exception e) {
+            log.error("Error generating report - ID: {}", reportId, e);
+            return ReportResponse.error("Report generation failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Create render options based on output format
+     */
+    private IRenderOption createRenderOptions(String format, String outputPath) throws Exception {
+        IRenderOption options;
+
+        switch (format.toLowerCase()) {
+            case "pdf":
+                options = new PDFRenderOption();
+                options.setOutputFormat("pdf");
+                break;
+            case "html":
+                HTMLRenderOption htmlOptions = new HTMLRenderOption();
+                htmlOptions.setOutputFormat("html");
+                htmlOptions.setEmbeddable(false);
+                options = htmlOptions;
+                break;
+            case "xls":
+                options = new EXCELRenderOption();
+                options.setOutputFormat("xls");
+                break;
+            case "xlsx":
+                options = new EXCELRenderOption();
+                options.setOutputFormat("xlsx");
+                break;
+            case "doc":
+            case "docx":
+                options = new RenderOption();
+                options.setOutputFormat(format);
+                break;
+            case "ppt":
+            case "pptx":
+                options = new RenderOption();
+                options.setOutputFormat(format);
+                break;
+            case "xml":
+                options = new RenderOption();
+                options.setOutputFormat("xml");
+                break;
+            default:
+                throw new IllegalArgumentException("Unsupported output format: " + format);
+        }
+
+        options.setOutputStream(new FileOutputStream(outputPath));
+        return options;
+    }
+
+    /**
+     * Get report generation status
+     */
+    public String getReportStatus(String reportId) {
+        return reportStatus.getOrDefault(reportId, "NOT_FOUND");
+    }
+
+    /**
+     * List available report templates
+     */
+    public String[] listReportTemplates() {
+        File reportDir = new File(reportDirectory);
+        if (!reportDir.exists() || !reportDir.isDirectory()) {
+            return new String[0];
+        }
+
+        return reportDir.list((dir, name) -> name.endsWith(".rptdesign"));
+    }
+}

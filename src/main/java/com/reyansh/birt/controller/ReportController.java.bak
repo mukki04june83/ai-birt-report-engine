@@ -1,0 +1,243 @@
+package com.reyansh.birt.controller;
+
+import com.reyansh.birt.model.ReportRequest;
+import com.reyansh.birt.model.ReportResponse;
+import com.reyansh.birt.service.ReportGenerationService;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import javax.validation.Valid;
+import java.io.File;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * REST Controller for BIRT Report Generation
+ * Provides endpoints for report generation, status checking, and downloads
+ */
+@Slf4j
+@RestController
+@RequestMapping("/api/reports")
+public class ReportController {
+
+    @Autowired
+    private ReportGenerationService reportGenerationService;
+
+    @Value("${birt.output.directory:reports/output}")
+    private String outputDirectory;
+
+    /**
+     * Generate report synchronously
+     */
+    @PostMapping("/generate")
+    public ResponseEntity<ReportResponse> generateReport(@Valid @RequestBody ReportRequest request) {
+        log.info("Received sync report generation request - Report: {}, Format: {}", 
+                request.getReportName(), request.getOutputFormat());
+
+        try {
+            String reportId = java.util.UUID.randomUUID().toString();
+            ReportResponse response = reportGenerationService.generateReport(request, reportId);
+            
+            HttpStatus status = response.isSuccess() ? HttpStatus.OK : HttpStatus.INTERNAL_SERVER_ERROR;
+            return ResponseEntity.status(status).body(response);
+        } catch (Exception e) {
+            log.error("Error in sync report generation", e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(ReportResponse.error(e.getMessage()));
+        }
+    }
+
+    /**
+     * Generate report asynchronously
+     * Returns immediately with report ID, report generates in background
+     */
+    @PostMapping("/generate/async")
+    public ResponseEntity<Map<String, String>> generateReportAsync(@Valid @RequestBody ReportRequest request) {
+        log.info("Received async report generation request - Report: {}, Format: {}", 
+                request.getReportName(), request.getOutputFormat());
+
+        try {
+            CompletableFuture<ReportResponse> future = reportGenerationService.generateReportAsync(request);
+            
+            Map<String, String> response = new HashMap<>();
+            response.put("message", "Report generation started");
+            response.put("status", "PROCESSING");
+            
+            // Extract report ID from future when completed
+            future.thenAccept(result -> {
+                log.info("Async report generation completed - ID: {}, Success: {}", 
+                        result.getReportId(), result.isSuccess());
+            });
+            
+            return ResponseEntity.accepted().body(response);
+        } catch (Exception e) {
+            log.error("Error starting async report generation", e);
+            Map<String, String> errorResponse = new HashMap<>();
+            errorResponse.put("message", "Failed to start report generation");
+            errorResponse.put("error", e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(errorResponse);
+        }
+    }
+
+    /**
+     * Generate multiple reports in parallel
+     */
+    @PostMapping("/generate/batch")
+    public ResponseEntity<Map<String, Object>> generateBatchReports(@RequestBody List<ReportRequest> requests) {
+        log.info("Received batch report generation request - Count: {}", requests.size());
+
+        try {
+            List<CompletableFuture<ReportResponse>> futures = requests.stream()
+                    .map(reportGenerationService::generateReportAsync)
+                    .toList();
+
+            // Wait for all reports to complete
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+            // Collect results
+            List<ReportResponse> results = futures.stream()
+                    .map(CompletableFuture::join)
+                    .toList();
+
+            long successCount = results.stream().filter(ReportResponse::isSuccess).count();
+            long failureCount = results.size() - successCount;
+
+            Map<String, Object> response = new HashMap<>();
+            response.put("totalReports", requests.size());
+            response.put("successCount", successCount);
+            response.put("failureCount", failureCount);
+            response.put("results", results);
+
+            log.info("Batch report generation completed - Total: {}, Success: {}, Failed: {}", 
+                    requests.size(), successCount, failureCount);
+
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            log.error("Error in batch report generation", e);
+            Map<String, Object> errorResponse = new HashMap<>();
+            errorResponse.put("message", "Batch report generation failed");
+            errorResponse.put("error", e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(errorResponse);
+        }
+    }
+
+    /**
+     * Get report generation status
+     */
+    @GetMapping("/status/{reportId}")
+    public ResponseEntity<Map<String, String>> getReportStatus(@PathVariable String reportId) {
+        log.debug("Checking report status - ID: {}", reportId);
+        
+        String status = reportGenerationService.getReportStatus(reportId);
+        
+        Map<String, String> response = new HashMap<>();
+        response.put("reportId", reportId);
+        response.put("status", status);
+        
+        return ResponseEntity.ok(response);
+    }
+
+    /**
+     * Download generated report
+     */
+    @GetMapping("/download/{fileName}")
+    public ResponseEntity<Resource> downloadReport(@PathVariable String fileName) {
+        log.info("Report download requested - File: {}", fileName);
+
+        try {
+            File file = new File(outputDirectory + File.separator + fileName);
+            
+            if (!file.exists()) {
+                log.warn("Report file not found: {}", fileName);
+                return ResponseEntity.notFound().build();
+            }
+
+            Resource resource = new FileSystemResource(file);
+            
+            // Determine media type based on file extension
+            MediaType mediaType = getMediaType(fileName);
+            
+            return ResponseEntity.ok()
+                    .contentType(mediaType)
+                    .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + fileName + "\"")
+                    .body(resource);
+                    
+        } catch (Exception e) {
+            log.error("Error downloading report: {}", fileName, e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+
+    /**
+     * List available report templates
+     */
+    @GetMapping("/templates")
+    public ResponseEntity<List<String>> listTemplates() {
+        log.debug("Listing available report templates");
+        
+        String[] templates = reportGenerationService.listReportTemplates();
+        List<String> templateList = Arrays.asList(templates);
+        
+        log.info("Found {} report templates", templateList.size());
+        return ResponseEntity.ok(templateList);
+    }
+
+    /**
+     * Health check endpoint
+     */
+    @GetMapping("/health")
+    public ResponseEntity<Map<String, String>> health() {
+        Map<String, String> response = new HashMap<>();
+        response.put("status", "UP");
+        response.put("service", "BIRT Report Engine");
+        response.put("timestamp", String.valueOf(System.currentTimeMillis()));
+        return ResponseEntity.ok(response);
+    }
+
+    /**
+     * Get supported output formats
+     */
+    @GetMapping("/formats")
+    public ResponseEntity<List<String>> getSupportedFormats() {
+        List<String> formats = Arrays.asList("pdf", "html", "xls", "xlsx", "doc", "docx", "ppt", "pptx", "xml");
+        return ResponseEntity.ok(formats);
+    }
+
+    /**
+     * Determine media type based on file extension
+     */
+    private MediaType getMediaType(String fileName) {
+        String extension = fileName.substring(fileName.lastIndexOf('.') + 1).toLowerCase();
+        
+        switch (extension) {
+            case "pdf":
+                return MediaType.APPLICATION_PDF;
+            case "html":
+                return MediaType.TEXT_HTML;
+            case "xls":
+            case "xlsx":
+                return MediaType.parseMediaType("application/vnd.ms-excel");
+            case "doc":
+            case "docx":
+                return MediaType.parseMediaType("application/msword");
+            case "ppt":
+            case "pptx":
+                return MediaType.parseMediaType("application/vnd.ms-powerpoint");
+            case "xml":
+                return MediaType.APPLICATION_XML;
+            default:
+                return MediaType.APPLICATION_OCTET_STREAM;
+        }
+    }
+}

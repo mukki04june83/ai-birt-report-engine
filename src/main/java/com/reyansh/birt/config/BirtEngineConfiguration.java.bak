@@ -1,0 +1,133 @@
+package com.reyansh.birt.config;
+
+import lombok.extern.slf4j.Slf4j;
+import org.eclipse.birt.core.exception.BirtException;
+import org.eclipse.birt.core.framework.Platform;
+import org.eclipse.birt.report.engine.api.EngineConfig;
+import org.eclipse.birt.report.engine.api.IReportEngine;
+import org.eclipse.birt.report.engine.api.IReportEngineFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+
+import javax.annotation.PreDestroy;
+import java.io.File;
+import java.util.concurrent.Executor;
+import java.util.logging.Level;
+
+/**
+ * BIRT Engine Configuration
+ * Configures BIRT report engine with multithreading support for scalable report generation
+ */
+@Slf4j
+@Configuration
+@EnableAsync
+@EnableScheduling
+public class BirtEngineConfiguration {
+
+    @Value("${birt.log.directory:logs}")
+    private String logDirectory;
+
+    @Value("${spring.task.execution.pool.core-size:10}")
+    private int corePoolSize;
+
+    @Value("${spring.task.execution.pool.max-size:50}")
+    private int maxPoolSize;
+
+    @Value("${spring.task.execution.pool.queue-capacity:100}")
+    private int queueCapacity;
+
+    @Value("${spring.task.execution.thread-name-prefix:report-exec-}")
+    private String threadNamePrefix;
+
+    private IReportEngine reportEngine;
+
+    /**
+     * Creates and configures the BIRT Report Engine
+     * Thread-safe singleton instance with optimized settings
+     */
+    @Bean
+    public IReportEngine reportEngine() throws BirtException {
+        log.info("Initializing BIRT Report Engine...");
+
+        // Create log directory if not exists
+        File logDir = new File(logDirectory);
+        if (!logDir.exists()) {
+            logDir.mkdirs();
+            log.info("Created log directory: {}", logDirectory);
+        }
+
+        // Configure BIRT Engine
+        EngineConfig config = new EngineConfig();
+        config.setLogConfig(logDirectory, Level.WARNING);
+        config.setTempDir(System.getProperty("java.io.tmpdir"));
+        
+        // Enable resource path for report resources
+        config.setResourcePath(logDirectory);
+        
+        // Set engine home (optional, for plugin loading)
+        String birtHome = System.getProperty("birt.home");
+        if (birtHome != null) {
+            config.setEngineHome(birtHome);
+        }
+
+        // Start BIRT Platform
+        Platform.startup(config);
+        log.info("BIRT Platform started successfully");
+
+        // Create Report Engine Factory
+        IReportEngineFactory factory = (IReportEngineFactory) Platform
+                .createFactoryObject(IReportEngineFactory.EXTENSION_REPORT_ENGINE_FACTORY);
+
+        // Create Report Engine instance
+        reportEngine = factory.createReportEngine(config);
+        log.info("BIRT Report Engine initialized successfully");
+
+        return reportEngine;
+    }
+
+    /**
+     * Configure Thread Pool Executor for async report generation
+     * Enables parallel processing of multiple reports
+     */
+    @Bean(name = "reportTaskExecutor")
+    public Executor reportTaskExecutor() {
+        log.info("Configuring Thread Pool for report generation - Core: {}, Max: {}, Queue: {}", 
+                corePoolSize, maxPoolSize, queueCapacity);
+
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(corePoolSize);
+        executor.setMaxPoolSize(maxPoolSize);
+        executor.setQueueCapacity(queueCapacity);
+        executor.setThreadNamePrefix(threadNamePrefix);
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(60);
+        
+        // Rejection policy - caller runs the task if queue is full
+        executor.setRejectedExecutionHandler(new java.util.concurrent.ThreadPoolExecutor.CallerRunsPolicy());
+        
+        executor.initialize();
+        log.info("Thread Pool Executor initialized successfully");
+        
+        return executor;
+    }
+
+    /**
+     * Shutdown BIRT Engine properly on application shutdown
+     */
+    @PreDestroy
+    public void destroy() {
+        log.info("Shutting down BIRT Report Engine...");
+        
+        if (reportEngine != null) {
+            reportEngine.destroy();
+            log.info("BIRT Report Engine destroyed");
+        }
+        
+        Platform.shutdown();
+        log.info("BIRT Platform shutdown complete");
+    }
+}

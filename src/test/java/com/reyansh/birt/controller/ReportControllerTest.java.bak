@@ -1,0 +1,49 @@
+package com.reyansh.birt.controller;
+
+import com.reyansh.birt.service.ReportGenerationService;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.http.MediaType;
+import org.springframework.test.web.servlet.MockMvc;
+
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+
+/**
+ * Unit tests for ReportController
+ */
+@WebMvcTest(ReportController.class)
+class ReportControllerTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @MockBean
+    private ReportGenerationService reportGenerationService;
+
+    @Test
+    void testHealthEndpoint() throws Exception {
+        mockMvc.perform(get("/api/reports/health"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("UP"))
+                .andExpect(jsonPath("$.service").value("BIRT Report Engine"));
+    }
+
+    @Test
+    void testGetSupportedFormats() throws Exception {
+        mockMvc.perform(get("/api/reports/formats"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$").isArray())
+                .andExpect(jsonPath("$[0]").value("pdf"));
+    }
+
+    @Test
+    void testListTemplates() throws Exception {
+        mockMvc.perform(get("/api/reports/templates"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$").isArray());
+    }
+}
